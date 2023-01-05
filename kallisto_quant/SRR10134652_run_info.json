@@ -1,0 +1,13 @@
+{
+	"n_targets": 234393,
+	"n_bootstraps": 0,
+	"n_processed": 32752423,
+	"n_pseudoaligned": 25280601,
+	"n_unique": 6973429,
+	"p_pseudoaligned": 77.2,
+	"p_unique": 21.3,
+	"kallisto_version": "0.46.1",
+	"index_version": 10,
+	"start_time": "Sat Apr 17 22:53:33 2021",
+	"call": "kallisto quant -i MS_index -o SRR10134652_quant -t 36 -g Homo_sapiens.GRCh38.103.gtf SRR10134652_trimQuality_1P SRR10134652_trimQuality_2P"
+}

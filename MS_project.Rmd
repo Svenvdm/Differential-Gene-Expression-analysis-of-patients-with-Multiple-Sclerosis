@@ -1,0 +1,306 @@
+---
+title: "RNA-seq differential expression analysis of patients with Multiple Sclerosis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center')
+knitr::opts_chunk$set(out.width = '60%')
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+
+
+library("ggplot2")
+library("RSQLite")
+library("DBI")
+library("htmltools")
+library("biomaRt")
+library("tximport")
+library("GEOquery")
+library("dplyr")
+library("affy")
+library("cowplot")
+library("reshape2")
+library("gridExtra")
+library("org.Hs.eg.db")
+library("edgeR")
+library("tidyr")
+library("GO.db")
+
+```
+
+# Sequencing data
+## General info
+#Read length: 150 bp
+#Single/paired end sequencing: paired end sequencing
+#Platform used: Illumina HiSeq 3000
+## Quality control on fastQ files has been done separately: see "multiqc_report.html"
+
+
+## (Pseudo)Count table
+```{r}
+# Get annotation data
+library("biomaRt")
+library("tximport")
+grch38 <- useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+data <- getBM(attributes = c('ensembl_gene_id', 'ensembl_transcript_id',   
+                             'external_gene_name'),
+              mart = grch38)
+tx2geneGtf <- dplyr::select(data, ensembl_transcript_id, ensembl_gene_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, TXNAME = ensembl_transcript_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, GENEID = ensembl_gene_id)
+head(tx2geneGtf)
+# Get file locations
+files <- list.files("./kallisto_quant/")
+files <- files[grep("abundance.tsv",files)]
+samples <- unlist(strsplit(files,"_"))[c(1:length(files))*2-1]
+files <- paste(rep("./kallisto_quant/",length(files)),files,sep="")
+names(files) <- samples
+# Load RNAseq data
+txi <- tximport(files, type = "kallisto", tx2gene = tx2geneGtf)
+head(txi$counts)
+dim(txi$counts)
+```
+
+## Preprocessing with EdgeR
+```{r}
+# Creating a DGEList object for use in edgeR.
+
+rawCts <- txi$counts
+# How many genes show no expression?
+no_expr <-sum(rowSums(rawCts==0)==ncol(rawCts))
+# 10222 genes show no expression for all samples
+
+normMat <- txi$length
+
+normMat <- normMat/exp(rowMeans(log(normMat)))
+normCts <- rawCts/normMat
+# Computing effective library sizes from scaled counts, to account for
+# composition biases between samples.
+
+effectiveLib <- calcNormFactors(normCts) * colSums(normCts)
+normMat <- sweep(normMat, 2, effectiveLib, "*")
+normMat <- log(normMat)
+
+
+
+rawData <- DGEList(rawCts)
+rawData$samples$group <- as.factor(rep(c("Control", "MS"),each = 6))
+rawData <- scaleOffset(rawData, normMat)
+
+# filter genes using filterByExpr function.
+keep <- filterByExpr(rawData)
+
+cpm <- cpm(rawData)
+
+filteredData <- rawData[keep,keep.lib.sizes=FALSE]
+# add filtered library to libsize
+libSize <- colSums(txi$counts)
+libSize$filtered.lib <- filteredData$samples$lib.size
+
+table(keep) # 40785 genes are removed. 20583 genes remain after filtering.
+totalGenes <- sum(table(keep))
+percentageKeep <- sum(keep)/totalGenes 
+
+# How has the gene filtering affected the total count number (library size) in each of the samples?
+filteredData$samples$lib.size/rawData$samples$lib.size 
+# filtering has lowered the total count number, as expected because genes are removed. The # impact however is small, because not so stringent conditions are used, so only low counts # are removed.
+
+# comparing filtered data with raw data using density plots
+lcpm.raw.counts <- cpm(rawCts, log=TRUE, normalized.lib.sizes = FALSE)
+colnames(lcpm.raw.counts) <- c("Control1","Control2","Control3","Control4","Control5","Control6","MS1","MS2","MS3","MS4","MS5","MS6")
+lcpm.raw.counts <- melt(as.data.frame(lcpm.raw.counts)) %>% 
+  rename("Sample" = variable, "Expression" = value) 
+raw_counts_plot <- ggplot(lcpm.raw.counts, aes(x = Expression, colour = Sample)) + 
+  geom_line(stat = 'density')+
+  labs(title = 'Raw data',  x = 'Log-cpm')
+lcpm.filtered.counts <- cpm(filteredData$counts,log=TRUE,normalized.lib.sizes=FALSE)
+colnames(lcpm.filtered.counts) <-c("Control1","Control2","Control3","Control4","Control5","Control6","MS1","MS2","MS3","MS4","MS5","MS6")
+lcpm.filtered.counts <- melt(as.data.frame(lcpm.filtered.counts)) %>% 
+  rename("Sample" = variable, "Expression" = value) 
+filtered_counts_plot <-ggplot(lcpm.filtered.counts, aes(x = Expression, colour = Sample)) + 
+  geom_line(stat = 'density')+
+  labs(title = 'Filtered data',  x = 'Log-cpm')
+raw_vs_filtered <- plot_grid(raw_counts_plot,filtered_counts_plot)
+```
+
+##Normalisation of the data using TMM method.
+
+```{r}
+# Keep copy of non-normalised filtered data
+cts.before.norm <- filteredData$counts
+# Perform TMM normalisation
+normFactors <- calcNormFactors(filteredData, method = "TMM") 
+normFactors$samples['sample_id'] <- rownames(normFactors$samples)
+normFactors$samples$norm.factors
+filtered_normfactor_data <- normFactors
+filtered_normalized_count_data <- cpm(filtered_normfactor_data,log=TRUE)
+
+## assessing the effect of normalisation
+lcpm <- edgeR::cpm(cts.before.norm, log=TRUE) 
+colnames(lcpm) <- c("Control1","Control2","Control3","Control4","Control5","Control6","MS1","MS2","MS3","MS4","MS5","MS6")
+lcpm.plot <-melt(as.data.frame(lcpm))%>% rename("Sample" = variable,"Expression" = value)
+# Boxplot 1 (unnormalised data)
+boxplotBeforeNorm <-ggplot(lcpm.plot,aes(y= Expression, colour = Sample))+ geom_boxplot()+labs(title="CPM with Unnormalised Library Size",y="Log-cpm")
+head(filtered_normalized_count_data)
+colnames(filtered_normalized_count_data)<-c("Control1","Control2","Control3","Control4","Control5","Control6","MS1","MS2","MS3","MS4","MS5","MS6")
+# Boxplot 2 (normalised data)
+lcpm.plot.norm <-melt(as.data.frame(filtered_normalized_count_data))%>% rename("Sample" = variable,"Expression" = value)
+boxplotAfterNorm <-ggplot(lcpm.plot.norm,aes(y= Expression, colour = Sample))+ geom_boxplot()+labs(title="CPM with Normalised Library Size",y="Log-cpm")
+
+unnorm_vs_norm <- plot_grid(boxplotBeforeNorm,boxplotAfterNorm)
+unnorm_vs_norm
+```
+
+
+## Calculate efflibsize and plot differences in library size.
+
+```{r}
+libsize <- colSums(txi$counts)
+libsize <- melt(libsize)
+libsize$sample <- rownames(libsize)
+libsize$group <-c("Control1","Control2","Control3","Control4","Control5","Control6","MS1","MS2","MS3","MS4","MS5","MS6")
+libsize$filtered.lib <- filteredData$samples$lib.size
+colnames(libsize) <- c("raw.lib","sample","group","filtered.lib")
+libsize$type <- rep(c("Control","MS"),each=6)
+
+efflibsize <- libsize$filtered.lib * normFactors$samples$norm.factors
+libsize$efflibsize <- efflibsize
+
+libsize_plot <- ggplot(data=libsize, aes(x = group, y = raw.lib)) + 
+  geom_bar(stat="identity", aes(fill = type))+
+  labs(title = "Raw Library Sizes", x = "Sample", y = "Library Size") +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+libsize_plot_normalised <- ggplot(libsize,aes(x=group,y=efflibsize))+geom_bar(stat="identity",aes(fill=type))+
+  labs(title="Effective Library sizes", x="Sample",y= "Library Size") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+libsizeplots <- plot_grid(libsize_plot,libsize_plot_normalised)
+libsizeplots
+
+```
+
+##Annotation
+
+```{r}
+gse <- getGEO("GSE137619")
+gsepheno <- pData(gse$GSE137619_series_matrix.txt.gz)
+
+result <- gsepheno %>% dplyr::select(c(title, source_name_ch1, characteristics_ch1, characteristics_ch1.1, characteristics_ch1.2)) %>%
+  dplyr::rename(sampling_site = "source_name_ch1", condition = "characteristics_ch1",
+         gender = "characteristics_ch1.1",
+         age = "characteristics_ch1.2")
+
+result <- gsepheno %>% dplyr::select(c(title, source_name_ch1, characteristics_ch1, characteristics_ch1.1, characteristics_ch1.2))
+colnames(result) <-  c('title', 'sampling_site', 'condition', 'gender', 'age')
+condition1 <- substring(result$condition, 12)
+gender1 <- substring(result$gender, 8)
+age1<- substring(result$age, 13)
+annotation <- result %>% mutate(condition = condition1, gender = gender1, age = age1)
+print(annotation)
+```
+
+##RNA-Seq Statistical Analysis: Differential Expression Analysis
+```{r}
+preprodata <- filtered_normfactor_data
+preprodata$samples$gender <- annotation$gender
+preprodata$samples$age <- annotation$age
+preprodata$samples$age <- as.numeric(preprodata$samples$age)
+preprodata$samples$gender <- as.factor(preprodata$samples$gender)
+str(preprodata$samples)
+design <- model.matrix(~ 0 + group + gender, data = preprodata$samples)
+colnames(design) <- c('Control', 'MS','gender')
+```
+
+## Estimation of the dispersions and BCV plot and fitting a model.
+```{r}
+preprodata <- estimateDisp(preprodata, design = design)
+p <- plotBCV(preprodata)
+
+fit <- glmQLFit(preprodata, design)
+plotQLDisp(fit)
+```
+
+##Differential expression.
+```{r}
+cont.matrix <- makeContrasts(Control-MS, levels = design)
+qlf.MS.control <- glmQLFTest(fit, contrast  = cont.matrix)
+top.qlf <- topTags(qlf.MS.control,adjust.method = "BH" ,n = Inf, sort.by = "p.value")
+
+sum(top.qlf$table$FDR < 0.05) 
+# 0 genes show differential expression
+edgeRoutput <- top.qlf$table
+
+# plotting the p-value distribution
+hist(edgeRoutput$PValue)
+
+# top 20 genes
+rownames(edgeRoutput)[1:20] 
+
+# we add the Entrez and gene IDs to the edgeR output
+ensembl <- useMart( "ensembl", dataset = "hsapiens_gene_ensembl" )
+genemap <- getBM( attributes = c("ensembl_gene_id", "external_gene_name","entrezgene_id"),
+filters = "ensembl_gene_id",
+values = rownames(edgeRoutput),
+mart = ensembl )
+
+idx <- match( rownames(edgeRoutput), genemap$ensembl_gene_id )
+
+edgeRoutput$gene_id <- genemap$external_gene_name[ idx ]
+edgeRoutput$entrez_id <- genemap$entrezgene_id[idx]
+
+# top 20 genes that are biologically significant (|logFC| > 2)
+edgeRoutput <- arrange(edgeRoutput,desc(abs(logFC)))
+edgeRoutput[1:20,]
+
+```
+
+##Plots
+```{r}
+# volcano plot
+volcanoData <- as.data.frame(cbind(edgeRoutput$logFC, -log10(edgeRoutput$FDR)))
+colnames(volcanoData) <- c("LogFC","logPval")
+
+
+volcanoplot <- ggplot(data=volcanoData,aes(x=LogFC,y=logPval))+geom_point(colour=(if_else(abs(volcanoData$LogFC)>2,"red","black")))+ylim(0,0.2)+scale_x_continuous(breaks=seq(-4.5,4.5,by=0.5)) + ylab("-LogPvalue") +xlim(-4.5,4.5)
+
+# MA-plot
+data <- as.data.frame(edgeRoutput)
+ggplot(data,aes(x = logCPM,y = logFC))+
+  geom_point(colour=(if_else(abs(volcanoData$LogFC)>2,"red","black"))) +
+  labs(title = "MA-plot MS vs control")
+  
+
+```
+
+##Gene Set Analysis on the top 150 biologically significant genes.
+```{r}
+# adjusting for gene length
+lengte <- txi$length
+lengte <- rowMeans(lengte)
+lengte <- melt(lengte)
+lengte$ensembl_id <- rownames(lengte)
+edgeRoutput$ensembl <- rownames(edgeRoutput)
+
+m <- match(edgeRoutput$ensembl, lengte$ensembl_id)
+edgeRoutput$length <- lengte$value[m]
+
+
+gsa_edgeR_input <- arrange(edgeRoutput,desc(abs(logFC)))
+gsa_edgeR_input <- gsa_edgeR_input[1:150,]
+
+gsa_edgeR <- goana(gsa_edgeR_input$entrez_id, species="Hs",universe=edgeRoutput$entrez_id,trend = edgeRoutput$length)
+gsa_edgeR$p.DE.adj <- p.adjust(gsa_edgeR$P.DE,n=nrow(gsa_edgeR),method="BH")
+gsa_edgeR <- gsa_edgeR[sort(gsa_edgeR$p.DE.adj,index.return=T)$ix,]
+head(gsa_edgeR)
+
+gsa_edgeR_sign <- gsa_edgeR[gsa_edgeR$p.DE.adj <0.05,] 
+aantal_gsa2_sign <-dim(gsa_edgeR_sign)[1]
+accession <- rownames(gsa_edgeR_sign)
+
+```
+
